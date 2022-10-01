@@ -39,13 +39,20 @@ class EfficientNet(nn.Module):
         return out_feats
 
 
-def conv2d(filter_in, filter_out, kernel_size):
+def cbl(filter_in, filter_out, kernel_size, stride=1):
     pad = (kernel_size - 1) // 2 if kernel_size else 0
     return nn.Sequential(OrderedDict([
-        ("conv", nn.Conv2d(filter_in, filter_out, kernel_size=kernel_size, stride=1, padding=pad, bias=False)),
+        ("conv", nn.Conv2d(filter_in, filter_out, kernel_size=kernel_size, stride=stride, padding=pad, bias=False)),
         ("bn", nn.BatchNorm2d(filter_out)),
         ("relu", nn.LeakyReLU(0.1)),
     ]))
+
+
+def spp(spp_in):
+    maxpool1 = nn.MaxPool2d(kernel_size=5, stride=1, padding=2)  # padding = (k - 1) // 2
+    maxpool2 = nn.MaxPool2d(kernel_size=9, stride=1, padding=4)
+    maxpool3 = nn.MaxPool2d(kernel_size=13, stride=1, padding=6)
+    return torch.cat(maxpool1(spp_in), maxpool2(spp_in), maxpool3(spp_in), spp_in)  # check default param torch.cat
 
 #------------------------------------------------------------------------#
 #   make_last_layers里面一共有七个卷积，前五个用于提取特征。
@@ -53,27 +60,27 @@ def conv2d(filter_in, filter_out, kernel_size):
 #------------------------------------------------------------------------#
 def make_last_layers(filters_list, in_filters, out_filter):
     m = nn.Sequential(
-        conv2d(in_filters, filters_list[0], 1),
-        conv2d(filters_list[0], filters_list[1], 3),
-        conv2d(filters_list[1], filters_list[0], 1),
-        conv2d(filters_list[0], filters_list[1], 3),
-        conv2d(filters_list[1], filters_list[0], 1),
-        conv2d(filters_list[0], filters_list[1], 3),
+        cbl(in_filters, filters_list[0], 1),
+        cbl(filters_list[0], filters_list[1], 3),
+        cbl(filters_list[1], filters_list[0], 1),
+        cbl(filters_list[0], filters_list[1], 3),
+        cbl(filters_list[1], filters_list[0], 1),
+        cbl(filters_list[0], filters_list[1], 3),
         nn.Conv2d(filters_list[1], out_filter, kernel_size=1, stride=1, padding=0, bias=True)
     )
     return m
 
 class YoloBody(nn.Module):
-    def __init__(self, anchors_mask, num_classes, phi=0, load_weights = False):
+    def __init__(self, anchors_mask, num_classes, phi=0, load_weights=False):
         super(YoloBody, self).__init__()
-        #---------------------------------------------------#   
+        #---------------------------------------------------#
         #   生成efficientnet的主干模型，以efficientnetB0为例
         #   获得三个有效特征层，他们的shape分别是：
         #   52, 52, 40
         #   26, 26, 112
         #   13, 13, 320
         #---------------------------------------------------#
-        self.backbone = EfficientNet(phi, load_weights = load_weights)
+        self.backbone = EfficientNet(phi, load_weights=load_weights)
 
         out_filters = {
             0: [40, 112, 320],
@@ -85,19 +92,40 @@ class YoloBody(nn.Module):
             6: [72, 200, 576],
             7: [80, 224, 640],
         }[phi]
+        filter_list = [out_filters[-1], int(out_filters[-1] / 2), int(out_filters[-1] / 4), int(out_filters[-1] / 8)]
 
-        self.last_layer0            = make_last_layers([out_filters[-1], int(out_filters[-1]*2)], out_filters[-1], len(anchors_mask[0]) * (num_classes + 5))
+        # Neck layers
+        self.spp_in = nn.Sequential(
+            cbl(filter_list[0], filter_list[1], 1),
+            cbl(filter_list[1], filter_list[0], 1),
+            cbl(filter_list[0], filter_list[1], 1)
+        )
 
-        self.last_layer1_conv       = conv2d(out_filters[-1], out_filters[-2], 1)
-        self.last_layer1_upsample   = nn.Upsample(scale_factor=2, mode='nearest')
-        self.last_layer1            = make_last_layers([out_filters[-2], int(out_filters[-2]*2)], out_filters[-2] + out_filters[-2], len(anchors_mask[1]) * (num_classes + 5))
+        self.spp_out = nn.Sequential(
+            cbl(int(out_filters[-1] * 2), filter_list[1], 1),
+            cbl(filter_list[1], filter_list[0], 1),
+            cbl(filter_list[0], filter_list[1], 1)
+        )
 
-        self.last_layer2_conv       = conv2d(out_filters[-2], out_filters[-3], 1)
-        self.last_layer2_upsample   = nn.Upsample(scale_factor=2, mode='nearest')
-        self.last_layer2            = make_last_layers([out_filters[-3], int(out_filters[-3]*2)], out_filters[-3] + out_filters[-3], len(anchors_mask[2]) * (num_classes + 5))
+        self.cbl2 = cbl(filter_list[1], filter_list[2], 1)
+        self.cbl3 = cbl(filter_list[2], filter_list[3], 1)
+        self.upsample = nn.Upsample(scale_factor=2)
+
+        # Last layers
+        self.last_layer0_conv = cbl(filter_list[2], filter_list[3], 1)
+        self.last_layers0     = make_last_layers([filter_list[3], filter_list[2]], filter_list[2],
+                                                 len(anchors_mask[0]) * (num_classes + 5))
+
+        self.last_layer1_conv = cbl(filter_list[3], filter_list[2], 3, stride=2)
+        self.last_layers1     = make_last_layers([filter_list[2], filter_list[1]], filter_list[1],
+                                                 len(anchors_mask[1]) * (num_classes + 5))
+
+        self.last_layer2_conv = cbl(filter_list[2], filter_list[1], 3, stride=2)
+        self.last_layers2     = make_last_layers([filter_list[1], filter_list[0]], filter_list[0],
+                                                 len(anchors_mask[2]) * (num_classes + 5))
 
     def forward(self, x):
-        #---------------------------------------------------#   
+        #---------------------------------------------------#
         #   获得三个有效特征层，他们的shape分别是：
         #   52, 52, 40
         #   26, 26, 112
@@ -105,32 +133,31 @@ class YoloBody(nn.Module):
         #---------------------------------------------------#
         x2, x1, x0 = self.backbone(x)
 
-        #---------------------------------------------------#
-        #   第一个特征层
-        #   out0 = (batch_size,255,13,13)
-        #---------------------------------------------------#
-        out0_branch = self.last_layer0[:5](x0)
-        out0        = self.last_layer0[5:](out0_branch)
+        spp_in = self.spp_in(x0)
+        spp_out = spp(spp_in)
+        panet_in = self.spp_out(spp_out)
 
-        x1_in = self.last_layer1_conv(out0_branch)
-        x1_in = self.last_layer1_upsample(x1_in)
+        panet_branch0 = self.cbl2(panet_in)
+        panet_branch0 = self.upsample(panet_branch0)
+        panet_branch1 = self.cbl2(x1)
+        panet_branch01 = torch.cat(panet_branch0, panet_branch1)
+        panet_branch01 = self.last_layers1[:5](panet_branch01)
 
-        x1_in = torch.cat([x1_in, x1], 1)
-        #---------------------------------------------------#
-        #   第二个特征层
-        #   out1 = (batch_size,255,26,26)
-        #---------------------------------------------------#
-        out1_branch = self.last_layer1[:5](x1_in)
-        out1        = self.last_layer1[5:](out1_branch)
+        in_small = self.cbl3(panet_branch01)
+        in_small = self.upsample(in_small)
+        panet_branch2 = self.cbl3(x2)
+        in_small = torch.cat(in_small, panet_branch2)
+        in_small = self.last_layers0[:5](in_small)
+        out_small = self.last_layers0[5:](in_small)
 
-        x2_in = self.last_layer2_conv(out1_branch)
-        x2_in = self.last_layer2_upsample(x2_in)
+        in_medium = self.last_layer1_conv(in_small)
+        in_medium = torch.cat(in_medium, panet_branch01)
+        in_medium = self.last_layers1[:5](in_medium)
+        out_medium = self.last_layers1[5:](in_medium)
 
-        x2_in = torch.cat([x2_in, x2], 1)
-        #---------------------------------------------------#
-        #   第一个特征层
-        #   out3 = (batch_size,255,52,52)
-        #---------------------------------------------------#
-        out2 = self.last_layer2(x2_in)
-        return out0, out1, out2
+        in_large = self.last_layer2_conv(in_medium)
+        in_large = torch.cat(in_large, panet_in)
+        in_large = self.last_layers2[:5](in_large)
+        out_large = self.last_layers2[5:](in_large)
 
+        return out_small, out_medium, out_large
