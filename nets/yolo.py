@@ -52,7 +52,7 @@ def spp(spp_in):
     maxpool1 = nn.MaxPool2d(kernel_size=5, stride=1, padding=2)  # padding = (k - 1) // 2
     maxpool2 = nn.MaxPool2d(kernel_size=9, stride=1, padding=4)
     maxpool3 = nn.MaxPool2d(kernel_size=13, stride=1, padding=6)
-    return torch.cat(maxpool1(spp_in), maxpool2(spp_in), maxpool3(spp_in), spp_in)  # check default param torch.cat
+    return torch.cat((maxpool1(spp_in), maxpool2(spp_in), maxpool3(spp_in), spp_in), 1)
 
 #------------------------------------------------------------------------#
 #   make_last_layers里面一共有七个卷积，前五个用于提取特征。
@@ -140,23 +140,23 @@ class YoloBody(nn.Module):
         panet_branch0 = self.cbl2(panet_in)
         panet_branch0 = self.upsample(panet_branch0)
         panet_branch1 = self.cbl2(x1)
-        panet_branch01 = torch.cat(panet_branch0, panet_branch1)
+        panet_branch01 = torch.cat((panet_branch0, panet_branch1), 1)
         panet_branch01 = self.last_layers1[:5](panet_branch01)
 
         in_small = self.cbl3(panet_branch01)
         in_small = self.upsample(in_small)
         panet_branch2 = self.cbl3(x2)
-        in_small = torch.cat(in_small, panet_branch2)
+        in_small = torch.cat((in_small, panet_branch2), 1)
         in_small = self.last_layers0[:5](in_small)
         out_small = self.last_layers0[5:](in_small)
 
         in_medium = self.last_layer1_conv(in_small)
-        in_medium = torch.cat(in_medium, panet_branch01)
+        in_medium = torch.cat((in_medium, panet_branch01), 1)
         in_medium = self.last_layers1[:5](in_medium)
         out_medium = self.last_layers1[5:](in_medium)
 
         in_large = self.last_layer2_conv(in_medium)
-        in_large = torch.cat(in_large, panet_in)
+        in_large = torch.cat((in_large, panet_in), 1)
         in_large = self.last_layers2[:5](in_large)
         out_large = self.last_layers2[5:](in_large)
 
