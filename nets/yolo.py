@@ -35,7 +35,7 @@ class EfficientNet(nn.Module):
                 feature_maps.append(x)
             last_x = x
         del last_x
-        out_feats = [feature_maps[2],feature_maps[3],feature_maps[4]]
+        out_feats = [feature_maps[2], feature_maps[3], feature_maps[4]]
         return out_feats
 
 
@@ -48,27 +48,78 @@ def cbl(filter_in, filter_out, kernel_size, stride=1):
     ]))
 
 
-def spp(spp_in):
-    maxpool1 = nn.MaxPool2d(kernel_size=5, stride=1, padding=2)  # padding = (k - 1) // 2
-    maxpool2 = nn.MaxPool2d(kernel_size=9, stride=1, padding=4)
-    maxpool3 = nn.MaxPool2d(kernel_size=13, stride=1, padding=6)
-    return torch.cat((maxpool1(spp_in), maxpool2(spp_in), maxpool3(spp_in), spp_in), 1)
+# ---------------------------------------------------#
+# three convolution block
+# conv2d (in_channels, out_channels, kernel_size, stride)
+# ---------------------------------------------------#
+def make_three_conv(filters_list, in_filters):
+    m = nn.Sequential(
+        cbl(in_filters, filters_list[0], 1),
+        cbl(filters_list[0], filters_list[1], 3),
+        cbl(filters_list[1], filters_list[0], 1),
+    )
+    return m
 
-#------------------------------------------------------------------------#
-#   make_last_layers里面一共有七个卷积，前五个用于提取特征。
-#   后两个用于获得yolo网络的预测结果
-#------------------------------------------------------------------------#
-def make_last_layers(filters_list, in_filters, out_filter):
+
+# ---------------------------------------------------#
+# Five convolution block
+# ---------------------------------------------------#
+def make_five_conv(filters_list, in_filters):
     m = nn.Sequential(
         cbl(in_filters, filters_list[0], 1),
         cbl(filters_list[0], filters_list[1], 3),
         cbl(filters_list[1], filters_list[0], 1),
         cbl(filters_list[0], filters_list[1], 3),
         cbl(filters_list[1], filters_list[0], 1),
-        cbl(filters_list[0], filters_list[1], 3),
-        nn.Conv2d(filters_list[1], out_filter, kernel_size=1, stride=1, padding=0, bias=True)
     )
     return m
+
+
+# ---------------------------------------------------#
+# SPP structure, using pooling kernels of different sizes for pooling
+# stack after pooling
+# ---------------------------------------------------#
+class SpatialPyramidPooling(nn.Module):
+    def __init__(self, pool_sizes=[5, 9, 13]):
+        super(SpatialPyramidPooling, self).__init__()
+
+        # nn.MaxPool2d(kernel_size, stride, padding)
+        self.maxpools = nn.ModuleList([nn.MaxPool2d(pool_size, 1, pool_size//2) for pool_size in pool_sizes])
+
+    def forward(self, x):
+        features = [maxpool(x) for maxpool in self.maxpools[::-1]]
+        features = torch.cat(features + [x], dim=1)
+
+        return features
+
+
+# ---------------------------------------------------#
+# convolution + upsampling
+# ---------------------------------------------------#
+class Upsample(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(Upsample, self).__init__()
+
+        self.upsample = nn.Sequential(
+            cbl(in_channels, out_channels, 1),
+            nn.Upsample(scale_factor=2, mode='nearest')
+        )
+
+    def forward(self, x,):
+        x = self.upsample(x)
+        return x
+
+
+# ---------------------------------------------------#
+# Finally get the output of yolov4
+# ---------------------------------------------------#
+def yolo_head(filters_list, in_filters):
+    m = nn.Sequential(
+        cbl(in_filters, filters_list[0], 3),
+        nn.Conv2d(filters_list[0], filters_list[1], 1),
+    )
+    return m
+
 
 class YoloBody(nn.Module):
     def __init__(self, anchors_mask, num_classes, phi=0, load_weights=False):
@@ -92,72 +143,69 @@ class YoloBody(nn.Module):
             6: [72, 200, 576],
             7: [80, 224, 640],
         }[phi]
-        filter_list = [out_filters[-1], int(out_filters[-1] / 2), int(out_filters[-1] / 4), int(out_filters[-1] / 8)]
 
-        # Neck layers
-        self.spp_in = nn.Sequential(
-            cbl(filter_list[0], filter_list[1], 1),
-            cbl(filter_list[1], filter_list[0], 1),
-            cbl(filter_list[0], filter_list[1], 1)
-        )
+        self.conv1 = make_three_conv([512, 1024], out_filters[2])
+        self.SPP = SpatialPyramidPooling()
+        self.conv2 = make_three_conv([512, 1024], 2048)
 
-        self.spp_out = nn.Sequential(
-            cbl(int(out_filters[-1] * 2), filter_list[1], 1),
-            cbl(filter_list[1], filter_list[0], 1),
-            cbl(filter_list[0], filter_list[1], 1)
-        )
+        self.upsample1 = Upsample(512, 256)
+        self.conv_for_P4 = cbl(out_filters[1], 256, 1)
+        self.make_five_conv1 = make_five_conv([256, 512], 512)
 
-        self.cbl2 = cbl(filter_list[1], filter_list[2], 1)
-        self.cbl3 = cbl(filter_list[2], filter_list[3], 1)
-        self.upsample = nn.Upsample(scale_factor=2)
+        self.upsample2 = Upsample(256, 128)
+        self.conv_for_P3 = cbl(out_filters[0], 128, 1)
+        self.make_five_conv2 = make_five_conv([128, 256], 256)
 
-        # Last layers
-        self.last_layer0_conv = cbl(filter_list[2], filter_list[3], 1)
-        self.last_layers0     = make_last_layers([filter_list[3], filter_list[2]], filter_list[2],
-                                                 len(anchors_mask[0]) * (num_classes + 5))
+        final_out_filter2 = len(anchors_mask[0]) * (5 + num_classes)
+        self.yolo_head3 = yolo_head([256, final_out_filter2], 128)
 
-        self.last_layer1_conv = cbl(filter_list[3], filter_list[2], 3, stride=2)
-        self.last_layers1     = make_last_layers([filter_list[2], filter_list[1]], filter_list[1],
-                                                 len(anchors_mask[1]) * (num_classes + 5))
+        self.down_sample1 = cbl(128, 256, 3, stride=2)
+        self.make_five_conv3 = make_five_conv([256, 512], 512)
+        final_out_filter1 = len(anchors_mask[1]) * (5 + num_classes)
+        self.yolo_head2 = yolo_head([512, final_out_filter1], 256)
 
-        self.last_layer2_conv = cbl(filter_list[2], filter_list[1], 3, stride=2)
-        self.last_layers2     = make_last_layers([filter_list[1], filter_list[0]], filter_list[0],
-                                                 len(anchors_mask[2]) * (num_classes + 5))
+        self.down_sample2 = cbl(256, 512, 3, stride=2)
+        self.make_five_conv4 = make_five_conv([512, 1024], 1024)
+        final_out_filter0 = len(anchors_mask[2]) * (5 + num_classes)
+        self.yolo_head1 = yolo_head([1024, final_out_filter0], 512)
 
     def forward(self, x):
-        #---------------------------------------------------#
-        #   获得三个有效特征层，他们的shape分别是：
-        #   52, 52, 40
-        #   26, 26, 112
-        #   13, 13, 320
-        #---------------------------------------------------#
+        # --------------------------------------------------- #
+        # Obtain three effective feature layers, their shapes are:
+        # 52, 52, 40
+        # 26, 26, 112
+        # 13, 13, 320
+        # --------------------------------------------------- #
         x2, x1, x0 = self.backbone(x)
 
-        spp_in = self.spp_in(x0)
-        spp_out = spp(spp_in)
-        panet_in = self.spp_out(spp_out)
+        # SPP:
+        P5 = self.conv1(x0)
+        P5 = self.SPP(P5)
+        P5 = self.conv2(P5)
 
-        panet_branch0 = self.cbl2(panet_in)
-        panet_branch0 = self.upsample(panet_branch0)
-        panet_branch1 = self.cbl2(x1)
-        panet_branch01 = torch.cat((panet_branch0, panet_branch1), 1)
-        panet_branch01 = self.last_layers1[:5](panet_branch01)
+        P5_upsample = self.upsample1(P5)
+        P4 = self.conv_for_P4(x1)
+        P4 = torch.cat([P4, P5_upsample], axis=1)
+        P4 = self.make_five_conv1(P4)
 
-        in_small = self.cbl3(panet_branch01)
-        in_small = self.upsample(in_small)
-        panet_branch2 = self.cbl3(x2)
-        in_small = torch.cat((in_small, panet_branch2), 1)
-        in_small = self.last_layers0[:5](in_small)
-        out_small = self.last_layers0[5:](in_small)
+        P4_upsample = self.upsample2(P4)
+        P3 = self.conv_for_P3(x2)
+        P3 = torch.cat([P3, P4_upsample], axis=1)
+        P3 = self.make_five_conv2(P3)
 
-        in_medium = self.last_layer1_conv(in_small)
-        in_medium = torch.cat((in_medium, panet_branch01), 1)
-        in_medium = self.last_layers1[:5](in_medium)
-        out_medium = self.last_layers1[5:](in_medium)
+        P3_downsample = self.down_sample1(P3)
+        P4 = torch.cat([P3_downsample, P4], axis=1)
+        P4 = self.make_five_conv3(P4)
 
-        in_large = self.last_layer2_conv(in_medium)
-        in_large = torch.cat((in_large, panet_in), 1)
-        in_large = self.last_layers2[:5](in_large)
-        out_large = self.last_layers2[5:](in_large)
+        P4_downsample = self.down_sample2(P4)
+        P5 = torch.cat([P4_downsample, P5], axis=1)
+        P5 = self.make_five_conv4(P5)
 
-        return out_small, out_medium, out_large
+        # P3: 52, 52, 128 =ConvBlock=> P3: 52, 52, 256 =1*1conv2d=> P3: 52, 52, num_anchors * (5 + num_classes)
+        out2 = self.yolo_head3(P3)
+        # P4: 26, 26, 256 =ConvBlock=> P4: 26, 26, 512 =1*1conv2d=> P4: 26, 26, num_anchors * (5 + num_classes)
+        out1 = self.yolo_head2(P4)
+        # P5: 13, 13, 512 =ConvBlock=> P5: 13, 13, 1024 =1*1conv2d=> P5: 13, 13, num_anchors * (5 + num_classes)
+        out0 = self.yolo_head1(P5)
+
+        return out0, out1, out2
