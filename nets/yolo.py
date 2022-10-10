@@ -4,6 +4,19 @@ import torch
 import torch.nn as nn
 
 from nets.efficientnet import EfficientNet as EffNet
+from .mobilenet_v3 import mobilenet_v3
+
+
+class MobileNetV3(nn.Module):
+    def __init__(self, pretrained = False):
+        super(MobileNetV3, self).__init__()
+        self.model = mobilenet_v3(pretrained=pretrained)
+
+    def forward(self, x):
+        out3 = self.model.features[:7](x)
+        out4 = self.model.features[7:13](out3)
+        out5 = self.model.features[13:16](out4)
+        return out3, out4, out5
 
 
 class EfficientNet(nn.Module):
