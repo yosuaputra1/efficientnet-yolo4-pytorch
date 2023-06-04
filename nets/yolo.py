@@ -5,6 +5,7 @@ import torch.nn as nn
 
 from nets.efficientnet import EfficientNet as EffNet
 from .mobilenet_v3 import mobilenet_v3
+from nets.CSPdarknet import darknet53
 
 
 class MobileNetV3(nn.Module):
@@ -135,27 +136,17 @@ def yolo_head(filters_list, in_filters):
 
 
 class YoloBody(nn.Module):
-    def __init__(self, anchors_mask, num_classes, phi=0, load_weights=False):
+    def __init__(self, anchors_mask, num_classes, phi=0, pretrained=False):
         super(YoloBody, self).__init__()
-        #---------------------------------------------------#
-        #   生成efficientnet的主干模型，以efficientnetB0为例
+        #---------------------------------------------------#   
+        #   生成CSPdarknet53的主干模型
         #   获得三个有效特征层，他们的shape分别是：
-        #   52, 52, 40
-        #   26, 26, 112
-        #   13, 13, 320
+        #   52,52,256
+        #   26,26,512
+        #   13,13,1024
         #---------------------------------------------------#
-        self.backbone = EfficientNet(phi, load_weights=load_weights)
-
-        out_filters = {
-            0: [40, 112, 320],
-            1: [40, 112, 320],
-            2: [48, 120, 352],
-            3: [48, 136, 384],
-            4: [56, 160, 448],
-            5: [64, 176, 512],
-            6: [72, 200, 576],
-            7: [80, 224, 640],
-        }[phi]
+        self.backbone   = darknet53(pretrained)
+        out_filters = [256, 512, 1024]
 
         self.conv1 = make_three_conv([512, 1024], out_filters[2])
         self.SPP = SpatialPyramidPooling()
@@ -183,15 +174,11 @@ class YoloBody(nn.Module):
         self.yolo_head1 = yolo_head([1024, final_out_filter0], 512)
 
     def forward(self, x):
-        # --------------------------------------------------- #
-        # Obtain three effective feature layers, their shapes are:
-        # 52, 52, 40
-        # 26, 26, 112
-        # 13, 13, 320
-        # --------------------------------------------------- #
+        # backbone
         x2, x1, x0 = self.backbone(x)
 
         # SPP:
+        # 13,13,1024 -> 13,13,512 -> 13,13,1024 -> 13,13,512 -> 13,13,2048 
         P5 = self.conv1(x0)
         P5 = self.SPP(P5)
         P5 = self.conv2(P5)
