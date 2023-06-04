@@ -57,8 +57,20 @@ def cbl(filter_in, filter_out, kernel_size, stride=1):
     return nn.Sequential(OrderedDict([
         ("conv", nn.Conv2d(filter_in, filter_out, kernel_size=kernel_size, stride=stride, padding=pad, bias=False)),
         ("bn", nn.BatchNorm2d(filter_out)),
-        ("relu", nn.LeakyReLU(0.1)),
+        ("relu", nn.ReLU6(inplace=True)),
     ]))
+
+
+def conv_dw(filter_in, filter_out, stride = 1):
+    return nn.Sequential(
+        nn.Conv2d(filter_in, filter_in, 3, stride, 1, groups=filter_in, bias=False),
+        nn.BatchNorm2d(filter_in),
+        nn.ReLU6(inplace=True),
+
+        nn.Conv2d(filter_in, filter_out, 1, 1, 0, bias=False),
+        nn.BatchNorm2d(filter_out),
+        nn.ReLU6(inplace=True),
+    )
 
 
 # ---------------------------------------------------#
@@ -68,7 +80,7 @@ def cbl(filter_in, filter_out, kernel_size, stride=1):
 def make_three_conv(filters_list, in_filters):
     m = nn.Sequential(
         cbl(in_filters, filters_list[0], 1),
-        cbl(filters_list[0], filters_list[1], 3),
+        conv_dw(filters_list[0], filters_list[1]),
         cbl(filters_list[1], filters_list[0], 1),
     )
     return m
@@ -80,9 +92,9 @@ def make_three_conv(filters_list, in_filters):
 def make_five_conv(filters_list, in_filters):
     m = nn.Sequential(
         cbl(in_filters, filters_list[0], 1),
-        cbl(filters_list[0], filters_list[1], 3),
+        conv_dw(filters_list[0], filters_list[1]),
         cbl(filters_list[1], filters_list[0], 1),
-        cbl(filters_list[0], filters_list[1], 3),
+        conv_dw(filters_list[0], filters_list[1]),
         cbl(filters_list[1], filters_list[0], 1),
     )
     return m
@@ -128,7 +140,7 @@ class Upsample(nn.Module):
 # ---------------------------------------------------#
 def yolo_head(filters_list, in_filters):
     m = nn.Sequential(
-        cbl(in_filters, filters_list[0], 3),
+        conv_dw(in_filters, filters_list[0]),
         nn.Conv2d(filters_list[0], filters_list[1], 1),
     )
     return m
@@ -172,12 +184,12 @@ class YoloBody(nn.Module):
         final_out_filter2 = len(anchors_mask[0]) * (5 + num_classes)
         self.yolo_head3 = yolo_head([256, final_out_filter2], 128)
 
-        self.down_sample1 = cbl(128, 256, 3, stride=2)
+        self.down_sample1 = conv_dw(128, 256, stride=2)
         self.make_five_conv3 = make_five_conv([256, 512], 512)
         final_out_filter1 = len(anchors_mask[1]) * (5 + num_classes)
         self.yolo_head2 = yolo_head([512, final_out_filter1], 256)
 
-        self.down_sample2 = cbl(256, 512, 3, stride=2)
+        self.down_sample2 = conv_dw(256, 512, stride=2)
         self.make_five_conv4 = make_five_conv([512, 1024], 1024)
         final_out_filter0 = len(anchors_mask[2]) * (5 + num_classes)
         self.yolo_head1 = yolo_head([1024, final_out_filter0], 512)
